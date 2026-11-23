@@ -2,9 +2,9 @@
 import os
 import json
 import requests
+
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import urljoin
 
 # ============================================================
 # CONFIGURATION
@@ -28,7 +28,6 @@ DATES = [
 FILM_ID = 34362
 FILM_NAME = "Avengers: Doomsday"
 
-# Any session containing one of these experiences will be ignored.
 EXCLUDED_EXPERIENCES = {
     "3D",
     "ScreenX",
@@ -39,36 +38,32 @@ STATE_FILE = Path("state.json")
 API_KEY = os.getenv("CINEPLEX_API_KEY")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
-# ============================================================
-# VALIDATION
-# ============================================================
-
 if not API_KEY:
-    raise RuntimeError("Missing CINEPLEX_API_KEY environment variable.")
+    raise RuntimeError("Missing CINEPLEX_API_KEY.")
 
 if not DISCORD_WEBHOOK:
-    raise RuntimeError("Missing DISCORD_WEBHOOK environment variable.")
+    raise RuntimeError("Missing DISCORD_WEBHOOK.")
 
 HEADERS = {
     "Ocp-Apim-Subscription-Key": API_KEY,
     "Accept": "application/json",
 }
 
+
 # ============================================================
 # DISCORD
 # ============================================================
 
 def send_discord(message):
-    """Send a message to Discord, splitting long messages if needed."""
-
-    max_length = 1900
+    """Send a Discord message, splitting long messages."""
 
     chunks = []
-    while len(message) > max_length:
-        split_at = message.rfind("\n", 0, max_length)
+
+    while len(message) > 1900:
+        split_at = message.rfind("\n", 0, 1900)
 
         if split_at == -1:
-            split_at = max_length
+            split_at = 1900
 
         chunks.append(message[:split_at])
         message = message[split_at:].strip()
@@ -86,7 +81,7 @@ def send_discord(message):
             response.raise_for_status()
 
         except requests.RequestException as error:
-            print(f"Discord notification failed: {error}")
+            print(f"Discord error: {error}")
 
 
 # ============================================================
@@ -94,12 +89,7 @@ def send_discord(message):
 # ============================================================
 
 def load_state():
-    """
-    Load previously detected sessions.
-
-    Supports both the newer {"seen": [...]} format and
-    older dictionary-based state files.
-    """
+    """Load previously detected showtimes."""
 
     if not STATE_FILE.exists():
         return set()
@@ -108,26 +98,23 @@ def load_state():
         with STATE_FILE.open("r", encoding="utf-8") as file:
             data = json.load(file)
 
-        # Current format
-        if isinstance(data, dict) and isinstance(data.get("seen"), list):
-            return set(str(item) for item in data["seen"])
-
-        # Legacy dictionary format
         if isinstance(data, dict):
-            return set(str(key) for key in data.keys())
+            if isinstance(data.get("seen"), list):
+                return set(str(x) for x in data["seen"])
 
-        # Legacy list format
+            return set(str(x) for x in data.keys())
+
         if isinstance(data, list):
-            return set(str(item) for item in data)
+            return set(str(x) for x in data)
 
     except (json.JSONDecodeError, OSError) as error:
-        print(f"Could not load state file: {error}")
+        print(f"Could not load state: {error}")
 
     return set()
 
 
 def save_state(seen_sessions):
-    """Save detected sessions to state.json."""
+    """Save tracked showtimes."""
 
     data = {
         "seen": sorted(seen_sessions)
@@ -142,11 +129,10 @@ def save_state(seen_sessions):
 
 
 # ============================================================
-# API
+# CINEPLEX API
 # ============================================================
 
 def get_showtimes(theatre_id, date):
-    """Retrieve showtimes for one theatre and one date."""
 
     url = f"{API_BASE}/showtimes"
 
@@ -170,193 +156,184 @@ def get_showtimes(theatre_id, date):
 
 
 # ============================================================
-# SESSION PARSING
+# EXPERIENCE FILTERING
 # ============================================================
 
-def walk_dicts(value):
-    """Recursively yield every dictionary in a JSON response."""
+def normalize_tag(tag):
+    """Normalize experience names for comparison."""
 
-    if isinstance(value, dict):
-        yield value
-
-        for child in value.values():
-            yield from walk_dicts(child)
-
-    elif isinstance(value, list):
-        for child in value:
-            yield from walk_dicts(child)
+    return "".join(
+        character.lower()
+        for character in str(tag)
+        if character.isalnum()
+    )
 
 
-def get_experience_tags(session):
+def is_excluded(experience_types):
     """
-    Extract experience tags from a session.
-
-    Supports string, list, and dictionary representations.
+    Exclude a session if ANY of its experience tags
+    matches an excluded experience.
     """
-
-    tags = []
-
-    experience_keys = {
-        "experience",
-        "experiences",
-        "experiencetag",
-        "experiencetags",
-        "experiencename",
-        "format",
-        "formats",
-        "formatname",
-    }
-
-    def extract(value):
-        if isinstance(value, str):
-            if value.strip():
-                tags.append(value.strip())
-
-        elif isinstance(value, list):
-            for item in value:
-                extract(item)
-
-        elif isinstance(value, dict):
-            for key, child in value.items():
-                if str(key).lower() in experience_keys:
-                    extract(child)
-
-    for key, value in session.items():
-        if str(key).lower() in experience_keys:
-            extract(value)
-
-    return sorted(set(tags))
-
-
-def get_session_time(session):
-    """Find a readable showtime from common API field names."""
-
-    possible_fields = [
-        "showTime",
-        "startTime",
-        "sessionTime",
-        "dateTime",
-        "startDateTime",
-        "showDateTime",
-        "start",
-    ]
-
-    for field in possible_fields:
-        value = session.get(field)
-
-        if value:
-            return str(value)
-
-    return "Time unavailable"
-
-
-def get_session_value(session, possible_fields, default=None):
-    """Return the first available value from a list of field names."""
-
-    for field in possible_fields:
-        value = session.get(field)
-
-        if value is not None:
-            return value
-
-    return default
-
-
-def is_excluded(tags):
-    """Return True if any experience tag matches an exclusion."""
 
     excluded = {
-        "".join(character.lower() for character in item if character.isalnum())
-        for item in EXCLUDED_EXPERIENCES
+        normalize_tag(tag)
+        for tag in EXCLUDED_EXPERIENCES
     }
 
-    for tag in tags:
-        normalized_tag = "".join(
-            character.lower()
-            for character in tag
-            if character.isalnum()
-        )
+    for tag in experience_types:
+
+        normalized = normalize_tag(tag)
 
         for excluded_tag in excluded:
-            if excluded_tag and excluded_tag in normalized_tag:
+
+            if excluded_tag in normalized:
                 return True
 
     return False
 
 
+# ============================================================
+# TIME FORMATTING
+# ============================================================
+
+def format_showtime(date_string):
+    """
+    Convert Cineplex local datetime into readable time.
+
+    Example:
+    2026-12-17T14:50:00 -> 2:50 PM
+    """
+
+    try:
+        showtime = datetime.fromisoformat(date_string)
+        return showtime.strftime("%I:%M %p").lstrip("0")
+
+    except (ValueError, TypeError):
+        return str(date_string)
+
+
+# ============================================================
+# SESSION EXTRACTION
+# ============================================================
+
 def extract_sessions(response_data):
     """
-    Find all session records in the API response.
+    Parse Cineplex's actual response structure:
 
-    The API can return duplicate records for the same session
-    under different experience configurations. We combine
-    those records by vistaSessionId before filtering.
+    theatre
+      -> dates
+        -> movies
+          -> experiences
+            -> experienceTypes
+            -> sessions
+
+    Duplicate sessions are grouped by vistaSessionId.
+    All experience tags are combined BEFORE filtering.
     """
 
     grouped_sessions = {}
 
-    for item in walk_dicts(response_data):
+    # Cineplex response is normally a list of theatres.
+    theatres = response_data if isinstance(response_data, list) else [response_data]
 
-        session_id = item.get("vistaSessionId")
+    for theatre in theatres:
 
-        if session_id is None:
-            continue
+        for date_info in theatre.get("dates", []):
 
-        session_id = str(session_id)
+            for movie in date_info.get("movies", []):
 
-        if session_id not in grouped_sessions:
-            grouped_sessions[session_id] = {
-                "session_id": session_id,
-                "records": [],
-                "experience_tags": set(),
-            }
+                # Make sure we are processing the requested movie.
+                if str(movie.get("id")) != str(FILM_ID):
+                    continue
 
-        grouped_sessions[session_id]["records"].append(item)
+                for experience in movie.get("experiences", []):
 
-        tags = get_experience_tags(item)
+                    # IMPORTANT:
+                    # experienceTypes belongs to the parent experience,
+                    # not to the individual session.
+                    experience_types = experience.get(
+                        "experienceTypes", []
+                    )
 
-        grouped_sessions[session_id]["experience_tags"].update(tags)
+                    for session in experience.get("sessions", []):
+
+                        session_id = session.get("vistaSessionId")
+
+                        if session_id is None:
+                            continue
+
+                        session_id = str(session_id)
+
+                        if session_id not in grouped_sessions:
+
+                            grouped_sessions[session_id] = {
+                                "session_id": session_id,
+                                "experience_types": set(),
+                                "session": session,
+                            }
+
+                        grouped = grouped_sessions[session_id]
+
+                        # Combine tags from every duplicate record.
+                        grouped["experience_types"].update(
+                            experience_types
+                        )
+
+                        # Keep a session record with useful links.
+                        current = grouped["session"]
+
+                        if not current.get("ticketingUrl") and session.get("ticketingUrl"):
+                            current["ticketingUrl"] = session["ticketingUrl"]
+
+                        if not current.get("seatMapUrl") and session.get("seatMapUrl"):
+                            current["seatMapUrl"] = session["seatMapUrl"]
 
     results = []
 
     for session_id, grouped in grouped_sessions.items():
 
-        records = grouped["records"]
-        tags = sorted(grouped["experience_tags"])
+        session = grouped["session"]
 
-        # Filter only AFTER combining all duplicate records.
-        if is_excluded(tags):
+        experience_types = sorted(
+            grouped["experience_types"]
+        )
+
+        # Filter AFTER collecting all experience tags.
+        if is_excluded(experience_types):
+
             print(
-                f"Skipping session {session_id}: "
-                f"excluded experience found: {tags}"
+                f"EXCLUDED: {session_id} | "
+                f"Experiences: {experience_types}"
             )
+
             continue
 
-        # Use the first record as the main session record.
-        session = records[0]
+        raw_time = session.get("showStartDateTime")
 
         results.append({
             "session_id": session_id,
-            "time": get_session_time(session),
-            "experience_tags": tags,
-            "seats_remaining": get_session_value(
-                session,
-                ["seatsRemaining", "SeatsRemaining"],
-            ),
-            "is_sold_out": get_session_value(
-                session,
-                ["isSoldOut", "IsSoldOut"],
-                False,
-            ),
-            "seat_map_url": get_session_value(
-                session,
-                ["seatMapUrl", "SeatMapUrl"],
-            ),
-            "ticket_url": get_session_value(
-                session,
-                ["ticketUrl", "bookingUrl", "url"],
-            ),
+
+            "time": format_showtime(raw_time),
+
+            "experience_types": experience_types,
+
+            "seats_remaining": session.get("seatsRemaining"),
+
+            "is_sold_out": session.get("isSoldOut", False),
+
+            "auditorium": session.get("auditorium"),
+
+            "seat_map_url": session.get("seatMapUrl"),
+
+            "ticketing_url": session.get("ticketingUrl"),
+
         })
+
+        print(
+            f"ELIGIBLE: {session_id} | "
+            f"{format_showtime(raw_time)} | "
+            f"{experience_types}"
+        )
 
     return results
 
@@ -366,36 +343,46 @@ def extract_sessions(response_data):
 # ============================================================
 
 def format_session_message(theatre_name, date, session):
-    """Format a newly detected session for Discord."""
 
-    tags = session["experience_tags"]
-
-    experience_text = (
-        ", ".join(tags) if tags else "Not specified"
-    )
+    experiences = ", ".join(
+        session["experience_types"]
+    ) or "Not specified"
 
     message = (
         f"🎬 **NEW {FILM_NAME} SHOWTIME FOUND!**\n"
         f"📍 **Theatre:** {theatre_name}\n"
         f"📅 **Date:** {date}\n"
         f"🕒 **Time:** {session['time']}\n"
-        f"🎥 **Experience:** {experience_text}\n"
-        f"🆔 **Session ID:** `{session['session_id']}`\n"
+        f"🎥 **Experience:** {experiences}\n"
     )
 
-    seats = session["seats_remaining"]
+    if session["auditorium"]:
+        message += f"🏢 **Auditorium:** {session['auditorium']}\n"
 
-    if seats is not None:
-        message += f"💺 **Seats remaining:** {seats}\n"
+    if session["seats_remaining"] is not None:
+        message += (
+            f"💺 **Seats remaining:** "
+            f"{session['seats_remaining']}\n"
+        )
 
     if session["is_sold_out"]:
-        message += "⚠️ **This session is marked as sold out.**\n"
+        message += "⚠️ **Marked as sold out**\n"
 
     if session["seat_map_url"]:
-        message += f"🗺️ [View Seat Map]({session['seat_map_url']})\n"
+        message += (
+            f"🗺️ [View Seat Map]"
+            f"({session['seat_map_url']})\n"
+        )
 
-    if session["ticket_url"]:
-        message += f"🎟️ [Book Tickets]({session['ticket_url']})\n"
+    if session["ticketing_url"]:
+        message += (
+            f"🎟️ [Book Tickets]"
+            f"({session['ticketing_url']})\n"
+        )
+
+    message += (
+        f"🆔 Session ID: `{session['session_id']}`"
+    )
 
     return message
 
@@ -407,16 +394,14 @@ def format_session_message(theatre_name, date, session):
 def main():
 
     print("=" * 55)
-    print(f"Starting Cineplex monitor: {FILM_NAME}")
-    print(f"Film ID: {FILM_ID}")
+    print(f"CINEPLEX MONITOR: {FILM_NAME}")
     print(f"Theatres: {len(THEATRES)}")
     print(f"Dates: {len(DATES)}")
-    print(f"Total API requests expected: {len(THEATRES) * len(DATES)}")
-    print(f"Excluded experiences: {EXCLUDED_EXPERIENCES}")
+    print(f"API requests: {len(THEATRES) * len(DATES)}")
+    print(f"Excluded: {EXCLUDED_EXPERIENCES}")
     print("=" * 55)
 
     seen_sessions = load_state()
-
     updated_state = set(seen_sessions)
 
     new_sessions = []
@@ -426,7 +411,7 @@ def main():
     total_checks = len(THEATRES) * len(DATES)
 
     # --------------------------------------------------------
-    # Check every theatre and date
+    # Check all theatres and dates
     # --------------------------------------------------------
 
     for theatre_id, theatre_name in THEATRES.items():
@@ -436,26 +421,34 @@ def main():
             print(f"\nChecking {theatre_name} | {date}")
 
             try:
-                response_data = get_showtimes(theatre_id, date)
+
+                response_data = get_showtimes(
+                    theatre_id,
+                    date,
+                )
 
                 sessions = extract_sessions(response_data)
 
                 successful_checks += 1
 
-                print(f"Found {len(sessions)} eligible sessions.")
+                print(
+                    f"Eligible sessions found: {len(sessions)}"
+                )
 
                 for session in sessions:
 
-                    # Unique key for theatre + date + session.
                     state_key = (
-                        f"{theatre_id}|{date}|{session['session_id']}"
+                        f"{theatre_id}|"
+                        f"{date}|"
+                        f"{session['session_id']}"
                     )
 
                     if state_key in seen_sessions:
                         continue
 
                     print(
-                        f"NEW SESSION: {session['session_id']} "
+                        f"NEW SESSION: "
+                        f"{session['session_id']} "
                         f"at {session['time']}"
                     )
 
@@ -467,31 +460,22 @@ def main():
                         "session": session,
                     })
 
-            except requests.RequestException as error:
-
-                error_message = (
-                    f"{theatre_name} on {date}: {error}"
-                )
-
-                print(f"API ERROR: {error_message}")
-                errors.append(error_message)
-
             except Exception as error:
 
                 error_message = (
-                    f"{theatre_name} on {date}: {error}"
+                    f"{theatre_name} | {date}: {error}"
                 )
 
-                print(f"UNEXPECTED ERROR: {error_message}")
+                print(f"ERROR: {error_message}")
                 errors.append(error_message)
 
     # --------------------------------------------------------
-    # Notify Discord about new sessions
+    # Send new showtime notifications
     # --------------------------------------------------------
 
     if new_sessions:
 
-        print(f"\nFound {len(new_sessions)} new sessions!")
+        print(f"\nNew sessions: {len(new_sessions)}")
 
         for item in new_sessions:
 
@@ -504,23 +488,24 @@ def main():
             send_discord(message)
 
     else:
+
         print("\nNo new sessions found.")
 
     # --------------------------------------------------------
-    # Report API errors
+    # Send error notification
     # --------------------------------------------------------
 
     if errors:
 
-        error_message = (
-            f"⚠️ **Cineplex Monitor Errors**\n"
+        message = (
+            "⚠️ **Cineplex Monitor Errors**\n"
             f"Successful checks: {successful_checks}/{total_checks}\n\n"
         )
 
         for error in errors:
-            error_message += f"• {error}\n"
+            message += f"• {error}\n"
 
-        send_discord(error_message)
+        send_discord(message)
 
     # --------------------------------------------------------
     # Heartbeat
@@ -528,10 +513,12 @@ def main():
 
     if successful_checks == total_checks and not new_sessions:
 
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        timestamp = datetime.utcnow().strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
 
         send_discord(
-            f"✅ Cineplex monitor is running.\n"
+            "✅ **Cineplex Monitor Running**\n"
             f"Checked {total_checks} theatre/date combinations.\n"
             f"No new {FILM_NAME} sessions found.\n"
             f"Last check: {timestamp}"
