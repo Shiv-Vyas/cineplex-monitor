@@ -55,7 +55,6 @@ HEADERS = {
 # ============================================================
 
 def send_discord(message):
-    """Send a Discord message, splitting long messages."""
 
     chunks = []
 
@@ -89,7 +88,6 @@ def send_discord(message):
 # ============================================================
 
 def load_state():
-    """Load previously detected showtimes."""
 
     if not STATE_FILE.exists():
         return set()
@@ -114,7 +112,6 @@ def load_state():
 
 
 def save_state(seen_sessions):
-    """Save tracked showtimes."""
 
     data = {
         "seen": sorted(seen_sessions)
@@ -160,7 +157,6 @@ def get_showtimes(theatre_id, date):
 # ============================================================
 
 def normalize_tag(tag):
-    """Normalize experience names for comparison."""
 
     return "".join(
         character.lower()
@@ -170,10 +166,6 @@ def normalize_tag(tag):
 
 
 def is_excluded(experience_types):
-    """
-    Exclude a session if ANY of its experience tags
-    matches an excluded experience.
-    """
 
     excluded = {
         normalize_tag(tag)
@@ -193,23 +185,27 @@ def is_excluded(experience_types):
 
 
 # ============================================================
-# TIME FORMATTING
+# DATE AND TIME FORMATTING
 # ============================================================
 
 def format_showtime(date_string):
-    """
-    Convert Cineplex local datetime into readable time.
-
-    Example:
-    2026-12-17T14:50:00 -> 2:50 PM
-    """
 
     try:
         showtime = datetime.fromisoformat(date_string)
         return showtime.strftime("%I:%M %p").lstrip("0")
 
     except (ValueError, TypeError):
-        return str(date_string)
+        return "Time unavailable"
+
+
+def format_date(date_string):
+
+    try:
+        parsed_date = datetime.strptime(date_string, "%m/%d/%Y")
+        return parsed_date.strftime("%A, %B %d, %Y")
+
+    except ValueError:
+        return date_string
 
 
 # ============================================================
@@ -217,24 +213,14 @@ def format_showtime(date_string):
 # ============================================================
 
 def extract_sessions(response_data):
-    """
-    Parse Cineplex's actual response structure:
-
-    theatre
-      -> dates
-        -> movies
-          -> experiences
-            -> experienceTypes
-            -> sessions
-
-    Duplicate sessions are grouped by vistaSessionId.
-    All experience tags are combined BEFORE filtering.
-    """
 
     grouped_sessions = {}
 
-    # Cineplex response is normally a list of theatres.
-    theatres = response_data if isinstance(response_data, list) else [response_data]
+    theatres = (
+        response_data
+        if isinstance(response_data, list)
+        else [response_data]
+    )
 
     for theatre in theatres:
 
@@ -242,15 +228,11 @@ def extract_sessions(response_data):
 
             for movie in date_info.get("movies", []):
 
-                # Make sure we are processing the requested movie.
                 if str(movie.get("id")) != str(FILM_ID):
                     continue
 
                 for experience in movie.get("experiences", []):
 
-                    # IMPORTANT:
-                    # experienceTypes belongs to the parent experience,
-                    # not to the individual session.
                     experience_types = experience.get(
                         "experienceTypes", []
                     )
@@ -274,19 +256,19 @@ def extract_sessions(response_data):
 
                         grouped = grouped_sessions[session_id]
 
-                        # Combine tags from every duplicate record.
                         grouped["experience_types"].update(
                             experience_types
                         )
 
-                        # Keep a session record with useful links.
+                        # Preserve useful links from the session.
                         current = grouped["session"]
 
-                        if not current.get("ticketingUrl") and session.get("ticketingUrl"):
-                            current["ticketingUrl"] = session["ticketingUrl"]
-
-                        if not current.get("seatMapUrl") and session.get("seatMapUrl"):
-                            current["seatMapUrl"] = session["seatMapUrl"]
+                        for field in [
+                            "seatMapUrl",
+                            "deeplinkUrl",
+                        ]:
+                            if not current.get(field) and session.get(field):
+                                current[field] = session[field]
 
     results = []
 
@@ -298,7 +280,6 @@ def extract_sessions(response_data):
             grouped["experience_types"]
         )
 
-        # Filter AFTER collecting all experience tags.
         if is_excluded(experience_types):
 
             print(
@@ -312,21 +293,10 @@ def extract_sessions(response_data):
 
         results.append({
             "session_id": session_id,
-
             "time": format_showtime(raw_time),
-
             "experience_types": experience_types,
-
-            "seats_remaining": session.get("seatsRemaining"),
-
-            "is_sold_out": session.get("isSoldOut", False),
-
-            "auditorium": session.get("auditorium"),
-
             "seat_map_url": session.get("seatMapUrl"),
-
-            "ticketing_url": session.get("ticketingUrl"),
-
+            "deeplink_url": session.get("deeplinkUrl"),
         })
 
         print(
@@ -348,25 +318,15 @@ def format_session_message(theatre_name, date, session):
         session["experience_types"]
     ) or "Not specified"
 
+    readable_date = format_date(date)
+
     message = (
         f"🎬 **NEW {FILM_NAME} SHOWTIME FOUND!**\n"
         f"📍 **Theatre:** {theatre_name}\n"
-        f"📅 **Date:** {date}\n"
+        f"📅 **Date:** {readable_date}\n"
         f"🕒 **Time:** {session['time']}\n"
         f"🎥 **Experience:** {experiences}\n"
     )
-
-    if session["auditorium"]:
-        message += f"🏢 **Auditorium:** {session['auditorium']}\n"
-
-    if session["seats_remaining"] is not None:
-        message += (
-            f"💺 **Seats remaining:** "
-            f"{session['seats_remaining']}\n"
-        )
-
-    if session["is_sold_out"]:
-        message += "⚠️ **Marked as sold out**\n"
 
     if session["seat_map_url"]:
         message += (
@@ -374,15 +334,11 @@ def format_session_message(theatre_name, date, session):
             f"({session['seat_map_url']})\n"
         )
 
-    if session["ticketing_url"]:
+    if session["deeplink_url"]:
         message += (
-            f"🎟️ [Book Tickets]"
-            f"({session['ticketing_url']})\n"
+            f"🎟️ [Book Tickets in Cineplex App]"
+            f"({session['deeplink_url']})\n"
         )
-
-    message += (
-        f"🆔 Session ID: `{session['session_id']}`"
-    )
 
     return message
 
