@@ -17,6 +17,8 @@ THEATRES = {
     7411: "SilverCity Brampton Cinemas",
     7122: "Cineplex Courtney Park",
     7420: "Cineplex Square One",
+    7123: "Cineplex Winston Churchill",
+    7285: "Cineplex Milton"
 }
 
 DATES = [
